@@ -1,0 +1,621 @@
+---
+title: "250323_data_cleaning"
+output: html_document
+date: "2025-07-07"
+---
+
+```{r setup, include=FALSE}
+
+rm(list = ls())
+
+library(tidyverse)
+library(haven)
+
+```
+
+```{r tsn_clean, include = FALSE}
+
+# tsnデータの読み込み
+# firm_exit_民事再生法_durationを読み込み
+df_tsn <- read_dta("C:/Users/user/Dropbox/EQ_Export_RA/Watanabe/dta/firm_exit/250320_firm_exit_民事再生法_duration.dta")
+# tsnの処理
+df_tsn <- df_tsn %>%
+  dplyr::rename(企業コード = kcd) %>%
+  dplyr::filter(企業コード != 0) %>%
+  # 企業コードが重複している(二回以上倒産している)場合は一回目を残す
+  group_by(企業コード) %>%
+  mutate(id_count = n()) %>%
+  # id_count == 1：一回しか倒産していない
+  # id_count >= 2：二回倒産した → tsn_hsi_ymdが小さいほうを残す
+  filter((id_count == 1) | (tsn_hsi_ymd == min(tsn_hsi_ymd))) %>%
+  ungroup() %>%
+  select(-id_count) 
+
+# KJ,kessanの決算期と比較のため年月のみ残す
+df_tsn <- df_tsn %>%
+  mutate(
+    # 倒産発生年月
+    # 再定義(申立,tsn_hsi_ymd,開始の順にtsn_yearを定義)
+    # 注意：申立・tsn_hsi_ymdが欠損だとしても、開始(認可)が非欠損の場合がある
+    tsn_hsi_ymd = coalesce(hsi_ymd申立, tsn_hsi_ymd, hsi_ymd開始),
+    tsn_hsi_ym = substr(tsn_hsi_ymd, 1, 6),
+    # 倒産終結年月
+    end_hsi_ym = substr(hsi_ymd終結, 1, 6)) %>%
+  # 終結した日がわからないとpost-performanceが図れないため削除(要件等)
+  dplyr::filter(!is.na(end_hsi_ym))
+
+```
+
+
+<!---20250813更新--->
+
+# kessan
+
+```{r kessan}
+
+# kessanクリーニング
+df_kessan <- read_dta("D:/yoshihiro/firm_exit/250320_kessan.dta")
+
+# 変数作成
+df_kessan <- df_kessan %>%
+  rename(
+    kessan_sales = 損益計算書売上高計,
+    total_assets = 貸借対照表資産の部資産合計,
+    total_liabilities = 貸借対照表負債純資産の部負債合計,
+    tangible_fixed_assets = 貸借対照表資産の部有形固定資産合計,
+    operating_mergins = 損益計算書営業利益,
+    ) %>%
+  mutate(interest_debt = 
+           貸借対照表負債純資産の部短期借入金 + 
+           貸借対照表負債純資産の部一年内返済の長期借入金 + 
+           貸借対照表負債純資産の部一年内償還の社債 + 
+           貸借対照表負債純資産の部社債 +  
+           貸借対照表負債純資産の部長期借入金) %>%
+  
+# 単位を調整する変数リスト
+vars <- (-c("データ区分", "企業コード", "決算期", "決算月数", "単位", "従業員数" ))
+
+df_kessan <- df_kessan %>%
+  # 単位を1000円に調整
+  # across : 複数の列にまとめて同じ処理をする
+  # ~ .x : 無名関数、~の右側で.xを使ってどんな処理(例.*1000)したいか(= function(.x) .x)、xの中身がacross
+  mutate(across(vars, 
+         ~ ifelse(単位 == 2, .x * 1000, .x)) %>%
+  # 各列の値を12カ月分に調整
+  mutate(multiplier = ifelse(!is.na(決算月数) & 決算月数 != 12, 12 / as.numeric(決算月数), 1),
+         across(vars, 
+         ~ .x * multiplier))) %>%
+  select(-multiplier)
+
+
+colnames(df_kessan)
+```
+
+```{r KJ}
+
+df_KJ <- read_csv("D:/yoshihiro/firm_exit/KJ/250320_KJ.csv")
+
+colnames(df_KJ)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!---20250813更新
+
+```{r KJ, include = FALSE}
+
+# KJを読み込み
+df_KJ <- read_dta("D:/yoshihiro/firm_exit/KJ/250320_KJ.dta")
+# tsnにある企業のみ残す
+df_KJ <- subset(df_KJ_original, 企業コード %in% df_tsn$企業コード)
+
+
+# 決算月が1月～3月の場合決算年を一年戻す（年度で合わせる）
+df_KJ <- df_KJ %>%
+  mutate(year = as.numeric(substr(当期決算決算年月, 1, 4)),
+         month = as.numeric(substr(当期決算決算年月, 5, 6)),
+         kessan_year = ifelse(month >= 4, year, year -1)) %>%
+  select(-year, -month) 
+
+# KJの重複調整&決算月数（売上高）調整
+df_KJ <- df_KJ %>%
+  # 企業コードとyearが重複している場合に最初のものを残す
+  # .keep.all = TRUEでほかの列を残す
+  # "二番目に大きい"とかはarrange & slice
+  distinct(企業コード, kessan_year, .keep_all = TRUE) %>%
+  # 決算月数調整(決算月数が12ではない場合、12/決算月数をかけて12か月分のデータに変換)
+  mutate(multiplier = ifelse(!is.na(当期決算月数) & 当期決算月数 != 12, 12/as.numeric(当期決算月数), 1),
+         当期決算売上高千円 = as.numeric(当期決算売上高千円) * multiplier) %>%
+  select(-multiplier)
+
+# 倒産直前データ----------------------------------------------------------------
+# tsnの倒産年月を結合-------------------------
+df_tsn_pre <- df_tsn %>%
+  select(企業コード, tsn_hsi_ym)
+df_KJ_pre <- df_KJ %>%
+  # tsn_hsi_ymと結合
+  left_join(df_tsn_pre, by = "企業コード") %>%
+  # tsn_hsi_ym - 決算年月が最小の自然数になる行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_tsn_kessan = as.numeric(tsn_hsi_ym) - as.numeric(当期決算決算年月)) %>%
+  filter(diff_tsn_kessan >= 0) %>%
+  filter(diff_tsn_kessan == min(diff_tsn_kessan)) %>%
+  rename(sales_pre = 当期決算売上高千円,
+         profit_pre = 当期決算利益金千円, 
+         決算年月_pre = 当期決算決算年月, 
+         kessan_year_pre = kessan_year) %>%
+  select(-tsn_hsi_ym, -diff_tsn_kessan, 
+         -前期決算売上高千円, -前期決算利益金千円, -前期決算決算年月, -前期決算月数, 
+         -前々期決算売上高千円, -前々期決算利益金千円, -前々期決算決算年月, -前々期決算月数,
+         -当期決算月数)
+rm(df_tsn_pre)
+
+df_tsn <- subset(df_tsn, 企業コード %in% df_KJ_pre$企業コード)
+df_tsn <- df_tsn %>% 
+  inner_join(df_KJ_pre, by = "企業コード")
+rm(df_KJ_pre)
+
+
+## 再生後データ-----------------------------------------------------------------
+# salesを補完------------------------
+df_KJ_post <- df_KJ %>%
+  # 処理中のメモリ節約のためいらない変数落とす
+  select(-starts_with("銀行コード"),
+         -仕入先名称仕入先名称, -販売先名称販売先名称,
+         -代表者氏名代表者氏名, -生年月日西暦, -男女区分) %>%
+  # 企業コードとyearが重複している場合には最初のものを採用
+  distinct(企業コード, kessan_year, .keep_all = TRUE) %>%
+  # kessan_yearが欠損なら削除
+  filter(!is.na(kessan_year)) %>%
+  # 企業ごとに処理
+  group_by(企業コード) %>%
+  arrange(企業コード, kessan_year) %>%
+  # 欠損しているkessan_yearを補完
+  # 企業コードごとに(group_by)、最小(min)のkessan_year-2から最大(max)のkessan_yearまで、by = 1刻みで連続(seq)になるように補完(complete)する
+  complete(kessan_year = seq((min(kessan_year, na.rm = TRUE)-2), 
+                             (max(kessan_year, na.rm = TRUE)), 
+                             by = 1)) %>%
+  # sales補完
+  # メモリを節約するなら、先にsalesの月数に合わせた調整をするべき(今回は決算年月まで必要だったため決算年月は仕方なし)
+  mutate(当期決算売上高千円 = ifelse(is.na(当期決算売上高千円), 
+                            lead(前期決算売上高千円, n = 1), 当期決算売上高千円),
+         当期決算利益金千円 = ifelse(is.na(当期決算利益金千円), 
+                            lead(前期決算利益金千円, n = 1), 当期決算利益金千円),
+         当期決算決算年月 = ifelse(is.na(当期決算決算年月), 
+                           lead(前期決算決算年月, n = 1), 当期決算決算年月),
+         当期決算月数 = ifelse(is.na(当期決算月数), 
+                         lead(前期決算月数, n = 1), 当期決算月数),
+         当期決算売上高千円 = ifelse(is.na(当期決算売上高千円), 
+                            lead(前々期決算売上高千円, n = 2), 当期決算売上高千円),
+         当期決算利益金千円 = ifelse(is.na(当期決算利益金千円), 
+                            lead(前期決算利益金千円, n = 2), 当期決算利益金千円),
+         当期決算決算年月 = ifelse(is.na(当期決算決算年月), 
+                           lead(前々期決算決算年月, n = 2), 当期決算決算年月),
+         当期決算月数 = ifelse(is.na(当期決算月数), 
+                         lead(前々期決算月数, n = 2), 当期決算月数),
+         sales_post = as.numeric(当期決算売上高千円),
+         profit_post = as.numeric(当期決算利益金千円),
+         決算年月_post = as.numeric(当期決算決算年月),
+         月数 = as.numeric(当期決算月数)) %>%
+  rename(kessan_year_post = kessan_year) %>%
+  # filter(!is.na(sales_post)) %>%
+  ungroup() %>%
+  select(-前期決算売上高千円, -前期決算利益金千円, -前期決算決算年月, -前期決算月数, 
+         -前々期決算売上高千円, -前々期決算利益金千円, -前々期決算決算年月, -前々期決算月数) %>%
+  # salesを12か月分に調整
+  mutate(multiplier = ifelse(!is.na(月数) & 月数 != 12, 12/月数, 1),
+         sales_post = sales_post * multiplier,
+         profit_post = profit_post * multiplier) %>%
+  select(-multiplier, -月数, -当期決算月数, -当期決算決算年月, -当期決算売上高千円, -当期決算利益金千円)
+
+
+# KJに終結日を結合-------------------------
+df_tsn_post <- df_tsn %>%
+  select(企業コード, end_hsi_ym)
+
+# 終結後1年目----------
+df_KJ_post1 <- df_KJ_post %>%
+  left_join(df_tsn_post, by = "企業コード") %>%
+  # 決算年月 - end_hsi_ymが最小の自然数になる行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算年月_post - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  filter(diff_kessan_end == min(diff_kessan_end)) %>%
+  select(-end_hsi_ym, -diff_kessan_end)
+
+df_tsn <- df_tsn %>%
+  inner_join(df_KJ_post1, by = "企業コード")
+rm(df_KJ_post1)
+  
+# 終結後二年目----------
+df_KJ_post2 <- df_KJ_post %>%
+  left_join(df_tsn_post, by = "企業コード")%>%
+  # 決算年月 - end_hsi_ymが二番目に小さい自然数の行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算年月_post - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  arrange(企業コード,diff_kessan_end) %>%
+  slice(2) %>%
+  select(-end_hsi_ym, -diff_kessan_end)
+
+df_tsn <- df_tsn  %>%
+  #suffix : joinする際に同じ名前の列がある場合、文字列を追加して区別
+  inner_join(df_KJ_post2, by = "企業コード", suffix = c("_1", "_2"))
+rm(df_KJ_post2)
+
+# 終結後三年目----------
+df_KJ_post3 <- df_KJ_post %>%
+  left_join(df_tsn_post, by = "企業コード")%>%
+  # 決算年月 - end_hsi_ymが二番目に小さい自然数の行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算年月_post - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  arrange(企業コード,diff_kessan_end) %>%
+  slice(3) %>%
+  select(-end_hsi_ym, -diff_kessan_end)
+rm(df_tsn_post)
+
+vars <- c("kessan_year_post", "sales_post", "profit_post", "決算年月_post")
+df_KJ_post3 <- df_KJ_post3 %>%
+  rename_with(~ paste0(., "_3"), all_of(vars))
+# 結合
+df_tsn <- df_tsn  %>%
+  left_join(df_KJ_post3, by = "企業コード")
+rm(df_KJ_post3, df_KJ_post)
+
+```
+
+```{r kessan, include = FALSE}
+
+## kessanをfirm_minji_durationに結合
+# データの読み込み
+df_kessan_origin <- read_dta("D:/yoshihiro/firm_exit/250320_kessan.dta")
+# tsno(master)にまれる企業コードのみをkessanで残す
+df_kessan <- subset(df_kessan_origin, 企業コード %in% df_tsn$企業コード) 
+
+# 変数作成
+df_kessan <- df_kessan %>%
+  rename(
+    #sales = 損益計算書売上高計,
+    total_assets = 貸借対照表資産の部資産合計,
+    total_liabilities = 貸借対照表負債純資産の部負債合計,
+    tangible_fixed_assets = 貸借対照表資産の部有形固定資産合計,
+    operating_mergins = 損益計算書営業利益,
+    ) %>%
+  mutate(interest_debt = 
+           貸借対照表負債純資産の部短期借入金 + 
+           貸借対照表負債純資産の部一年内返済の長期借入金 + 
+           貸借対照表負債純資産の部一年内償還の社債 + 
+           貸借対照表負債純資産の部社債 +  
+           貸借対照表負債純資産の部長期借入金) %>%
+  select(-c("貸借対照表負債純資産の部短期借入金",
+            "貸借対照表負債純資産の部一年内返済の長期借入金",
+            "貸借対照表負債純資産の部一年内償還の社債",
+            "貸借対照表負債純資産の部社債",
+            "貸借対照表負債純資産の部長期借入金"))
+
+# 単位を調整する変数リスト
+vars <- (c("tangible_fixed_assets", "total_assets", "total_liabilities", 
+           "operating_mergins", "interest_debt"))
+
+df_kessan <- df_kessan %>%
+  # 単位を1000円に調整
+  # across : 複数の列にまとめて同じ処理をする
+  # ~ .x : 無名関数、~の右側で.xを使ってどんな処理(例.*1000)したいか(= function(.x) .x)、xの中身がacross
+  mutate(across(vars, 
+         ~ ifelse(単位 == 2, .x * 1000, .x)) %>%
+  # 各列の値を12カ月分に調整
+  mutate(multiplier = ifelse(!is.na(決算月数) & 決算月数 != 12, 12 / as.numeric(決算月数), 1),
+         across(vars, 
+         ~ .x * multiplier))) %>%
+  select(-multiplier)
+
+
+
+# tsn_hsi_ymd - 決算期が最小な自然数になるように決算期を選択
+# 該当決算期のkessan情報と、終結後翌年と翌々年の決算情報を結合
+# (翌年:決算期 - 終結が最小な自然数となる決算期←定義要検討)
+
+
+# kessanに結合する倒産発生年月を抽出--------------------------------------------
+df_tsn_pre <- df_tsn %>%
+  select(企業コード, tsn_hsi_ym)
+
+df_kessan_pre <- df_kessan %>%
+  # m:1で結合
+  left_join(df_tsn_pre, by = "企業コード") %>%
+  group_by(企業コード) %>%
+  # tsn_hsi_ym - 決算期が最小な自然数になるように決算期を選択
+  mutate(diff_tsn_kessan = as.numeric(tsn_hsi_ym) - as.numeric(決算期)) %>%
+  filter(diff_tsn_kessan >= 0) %>%
+  filter(diff_tsn_kessan == min(diff_tsn_kessan)) %>%
+  ungroup() %>%
+  select(-diff_tsn_kessan, -tsn_hsi_ym, -決算月数, -従業員数, -単位, -決算期)
+rm(df_tsn_pre)
+
+df_kessan_pre <- df_kessan_pre %>%
+  rename_with(~ paste0(., "_pre"), all_of(vars))
+# tsn_KJにkessanを結合
+df_tsn <- df_tsn %>%
+  inner_join(df_kessan_pre, by = "企業コード")
+rm(df_kessan_pre)
+
+
+# kessanに終結日を結合----------------------------------------------------------
+df_tsn_post <- df_tsn %>%
+  select(企業コード, end_hsi_ym)
+
+# 終結後1年目----------
+df_kessan_post1 <- df_kessan %>%
+  left_join(df_tsn_post, by = "企業コード") %>%
+  # 決算年月 - end_hsi_ymが最小の自然数になる行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算期 - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  filter(diff_kessan_end == min(diff_kessan_end)) %>%
+  select(-決算月数, -従業員数, -単位, -決算期, -end_hsi_ym, -diff_kessan_end)
+
+df_tsn <- df_tsn %>%
+  inner_join(df_kessan_post1, by = "企業コード")
+rm(df_kessan_post1)
+  
+# 終結後二年目----------
+df_kessan_post2 <- df_kessan %>%
+  left_join(df_tsn_post, by = "企業コード")%>%
+  # 決算年月 - end_hsi_ymが二番目に小さい自然数の行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算期 - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  arrange(企業コード,diff_kessan_end) %>%
+  slice(2) %>%
+  select(-end_hsi_ym, -diff_kessan_end, -決算月数, -従業員数, -単位, -決算期)
+
+df_tsn<- df_tsn  %>%
+  #suffix : joinする際に同じ名前の列がある場合、文字列を追加して区別
+  inner_join(df_kessan_post2, by = "企業コード", suffix = c("_post_1", "_post_2"))
+rm(df_kessan_post2)
+
+# 終結後三年目----------
+df_kessan_post3 <- df_kessan %>%
+  left_join(df_tsn_post, by = "企業コード")%>%
+  # 決算年月 - end_hsi_ymが二番目に小さい自然数の行のみを残す
+  group_by(企業コード) %>%
+  mutate(diff_kessan_end = 決算期 - as.numeric(end_hsi_ym)) %>%
+  filter(diff_kessan_end >= 0) %>%
+  arrange(企業コード,diff_kessan_end) %>%
+  slice(3) %>%
+  select(-end_hsi_ym, -diff_kessan_end, -決算月数, -従業員数, -単位, -決算期)
+rm(df_tsn_post)
+
+df_kessan_post3 <- df_kessan_post3 %>%
+  rename_with(~ paste0(., "_post_3"), all_of(vars))
+
+df_tsn <- df_tsn  %>%
+  left_join(df_kessan_post3, by = "企業コード")
+rm(df_kessan_post3)
+
+```
+
+```{r write, include = FALSE}
+
+# 保存
+write_dta(df_tsn, "D:/yoshihiro/firm_exit/250323_tsn_KJ_kessan.dta")
+
+```
+
+
+```{r bank_manager_client, include = FALSE}
+
+## 銀行との関係性-----------------------------------------------------------------
+
+
+df <- read_dta("D:/yoshihiro/firm_exit/250323_tsn_KJ_kessan.dta")
+# KJを読み込み
+df_KJ_original <- read_dta("D:/yoshihiro/firm_exit/KJ/250321_KJ.dta")
+
+df_bank <- subset(df_KJ_original, 企業コード %in% df$企業コード)
+# 銀行コード == 9999000(銀行不明)のデータ削除
+df_bank <- df_bank %>%
+  dplyr::filter(銀行コード１!= 9999000)
+
+
+##  flag_1作成(倒産年=tとしたとき、t-1,t-2,t-3,t-4,t-5で取引銀行が変わっているか)
+
+# df_bankにおいて、(df$tsn_year)にtsn_flagを立てる
+# 倒産した年の一年前のkessan_yearを倒産直前の財務状況とする
+# 注意:firm_minji_duration_bankのtsn_yearはkessan_year+1として、firm_minji_durationのtsn_yearとぶつけるときに倒産直前(1年前)とぶつけれるように
+df_bank <- df_bank %>%
+  dplyr::mutate(tsn_year = year + 1)
+df <- df %>%
+  mutate(tsn_year = substr(tsn_hsi_ymd, 1, 4))
+df_bank$tsn_flag <- ifelse(
+  paste(df_bank$企業コード, df_bank$tsn_year) %in% paste(df$企業コード, df$tsn_year),
+  1, NA
+)
+
+# firm_minji_duration_bankにおいてtsn_yearより後のデータを削除
+df_bank <- df_bank %>%
+  dplyr::group_by(企業コード) %>%
+  dplyr::arrange(企業コード, year) %>%
+  # which(x == 2)[1]で最初([1]番目)にx == 2が出てくるのは何番目？
+  dplyr::mutate(flag_row = which(tsn_flag == 1)[1],
+                row_in_group = row_number()) %>%
+  dplyr::filter(!is.na(flag_row) & row_in_group <= flag_row) %>%
+  dplyr::ungroup()
+
+
+# lagを取る
+zenkaku <- c("１", "２", "３", "４", "５", "６", "７", "８", "９", "１０")
+
+df_bank <- df_bank %>%
+  group_by(企業コード) %>%
+  arrange(企業コード, desc(year)) %>%
+  # across(.cols = .., .fns = .., .names = ..)
+  # .cols:対象にする列の指定,.fns:適用する関数(~lag),.names:出力される列名のテンプレート
+  mutate(across(
+    .cols = all_of(paste0("銀行コード", zenkaku)),
+    .fns = ~lag(.),
+    .names = "l_{col}"
+  )) %>%
+  ungroup()
+
+for (i in zenkaku) {
+  var_name <- paste0("銀行コード", i)
+  lag_var_name <- paste0("l_銀行コード",i)
+  flag_col <- paste0("change_flag", i)
+  
+  # [["列名"]]:文字列や変数で列名を指定可能(動的,ループでもOK),df$列名:手入力の列名にアクセス(固定),df["列名"]:データフレームとして取り出す(動的,返り値 = df)
+  df_bank[[flag_col]] <- ifelse(df_bank[[var_name]] != df_bank[[lag_var_name]], 1, 0)
+}
+
+## flag定義 flagx_y:x = 倒産から離れている年数(x年前),y = 銀行コードy(yが小さいほど主要取引先)
+# 倒産した年から何年離れているか
+# tsn_flagが立っている年を基準に何年離れているか
+# year = t-1年
+df_bank <- df_bank %>%
+  group_by(企業コード) %>%
+  mutate(flag1_1 = ifelse(tsn_flag == 1 & lead(change_flag１ == 1), 1, 0)) %>%
+  ungroup()
+table(df_bank$flag1_1)
+# 0     1 
+# 6596   123 
+# firm_minji_durationにperiod_flagを結合
+df_flag <- df_bank %>%
+  filter(flag1_1 == 1) %>%
+  select(企業コード, flag1_1)
+df <- df %>%
+  left_join(df_flag, by = "企業コード")
+rm(df_flag)
+
+# year = t-2年
+df_bank <- df_bank %>%
+  group_by(企業コード) %>%
+  mutate(flag2_1 = ifelse(tsn_flag == 1 & lead(change_flag１, 2) == 1, 1, 0)) %>%
+  ungroup()
+table(df_bank$flag2_1)
+# 0    1 
+# 5513  108 
+# firm_minji_durationにperiod_flagを結合
+df_flag <- df_bank %>%
+  filter(flag2_1 == 1) %>%
+  select(企業コード, flag2_1)
+df <- df %>%
+  left_join(df_flag, by = "企業コード")
+rm(df_flag)
+
+# year = t-3年
+df_bank <- df_bank %>%
+  group_by(企業コード) %>%
+  mutate(flag3_1 = ifelse(tsn_flag == 1 & lead(change_flag１, 3) == 1, 1, 0)) %>%
+  ungroup()
+table(df_bank$flag3_1)
+# 0    1 
+# 4508   89 
+# firm_minji_durationにperiod_flagを結合
+df_flag <- df_bank %>%
+  filter(flag3_1 == 1) %>%
+  select(企業コード, flag3_1)
+df <- df %>%
+  left_join(df_flag, by = "企業コード")
+rm(df_flag)
+
+# 取引数カウント----------------------------------------------------------------
+df <- df %>%
+  mutate(sup_count = str_count(仕入先名称仕入先名称, "，") + 1,
+         cus_count = str_count(販売先名称販売先名称, "，") + 1) %>%
+  rename(manager_name = 代表者氏名代表者氏名)
+
+
+# 経営者変更フラグ＆取引先数差分------------------------------------------------
+
+df_KJ_sub <- subset(df_KJ_original, 企業コード %in% df$企業コード)
+# 取引数カウント
+df_KJ_sub <- df_KJ_sub %>%
+  mutate(sup_count = str_count(仕入先名称仕入先名称, "，") + 1,
+         cus_count = str_count(販売先名称販売先名称, "，") + 1,
+         manager_name = str_remove_all(代表者氏名代表者氏名, "[ ・　]"),
+         kessan_year_post_1 = year,
+         kessan_year_post_2 = year)
+
+# 倒産後一年目
+df <- df %>%
+  left_join(df_KJ_sub %>%
+              select(企業コード, kessan_year_post_1, sup_count, cus_count,
+                     manager_name, 生年月日西暦, 男女区分),
+            by = c("企業コード", "kessan_year_post_1"), suffix = c("_pre", "_post_1")) %>%
+  mutate(sup_diff_1 = sup_count_post_1 - sup_count_pre,
+         cus_diff_1 = cus_count_post_1 - cus_count_pre,
+         manager_change = ifelse(manager_name_pre != manager_name_post_1, 1, 0))
+
+# 倒産後二年目
+vars <- c("sup_count", "cus_count", "manager_name", "生年月日西暦", "男女区分")
+df_KJ_sub <- df_KJ_sub %>%
+  select(企業コード, kessan_year_post_2, sup_count, cus_count,
+         manager_name, 生年月日西暦, 男女区分) %>%
+  rename_with(~ paste0(., "_post_2"), all_of(vars))
+
+df <- df %>%
+  left_join(df_KJ_sub, by = c("企業コード", "kessan_year_post_2")) %>%
+  mutate(sup_diff_2 = sup_count_post_2 - sup_count_pre,
+         cus_diff_2 = cus_count_post_2 - cus_count_pre,
+         manager_change = ifelse(manager_name_pre != manager_name_post_2, 1, 0))
+
+# 保存
+write_dta(df, "D:/yoshihiro/firm_exit/250323_tsn_KJ_kessan_change.dta")
+
+
+
+
+
+# # 四年前以上は一旦保留
+# # kessan_year = t-4年
+# firm_minji_duration_bank <- firm_minji_duration_bank %>%
+#   group_by(企業コード) %>%
+#   mutate(period4_change_flag = ifelse(tsn_flag == 1 & lead(change_flag１, 4) == 1, 1, NA)) %>%
+#   ungroup()
+# table(firm_minji_duration_bank$period4_change_flag)
+# # firm_minji_durationにperiod_flagを結合
+# period_change_flag <- firm_minji_duration_bank %>%
+#   filter(period4_change_flag == 1) %>%
+#   select(企業コード, period4_change_flag)
+# firm_minji_duration <- firm_minji_duration %>%
+#   left_join(period_change_flag, by = "企業コード")
+# rm(period_change_flag)
+# 
+# # kessan_year = t-5年
+# firm_minji_duration_bank <- firm_minji_duration_bank %>%
+#   group_by(企業コード) %>%
+#   mutate(period5_change_flag = ifelse(tsn_flag == 1 & lead(change_flag１, 5) == 1, 1, NA)) %>%
+#   ungroup()
+# table(firm_minji_duration_bank$period5_change_flag)
+# # firm_minji_durationにperiod_flagを結合
+# period_change_flag <- firm_minji_duration_bank %>%
+#   filter(period5_change_flag == 1) %>%
+#   select(企業コード, period5_change_flag)
+# firm_minji_duration <- firm_minji_duration %>%
+#   left_join(period_change_flag, by = "企業コード")
+# rm(period_change_flag)
+
+
+
+
+
+```
+
+--->
+
